@@ -805,6 +805,84 @@ enum FrameLoop {
 }
 
 pub(crate) struct WaylandWindow(pub WaylandWindowStatePtr);
+
+fn schedule_frame(frame_loop: &Cell<FrameLoop>, frame_ping: &Ping) {
+    match frame_loop.get() {
+        FrameLoop::Parked => {
+            frame_loop.set(FrameLoop::Scheduled);
+            frame_ping.ping();
+        }
+        FrameLoop::Ticking => frame_loop.set(FrameLoop::RescheduleRequested),
+        // A configure, compositor callback, ping, or retry already owns the wakeup.
+        _ => {}
+    }
+}
+
+fn frame_waker(frame_loop: Rc<Cell<FrameLoop>>, frame_ping: Ping) -> Rc<dyn Fn()> {
+    // Do not capture the window: its callbacks hold the invalidator, which holds this waker.
+    Rc::new(move || schedule_frame(&frame_loop, &frame_ping))
+}
+
+#[cfg(test)]
+mod frame_waker_tests {
+    use super::*;
+    use calloop::{EventLoop, ping::make_ping};
+    use std::time::Duration;
+
+    #[test]
+    fn idle_frame_demand_wakes_the_event_loop_and_coalesces() {
+        let mut event_loop = EventLoop::<usize>::try_new().unwrap();
+        let (ping, source) = make_ping().unwrap();
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let state = Rc::new(Cell::new(FrameLoop::Parked));
+        let wake = frame_waker(state.clone(), ping);
+        let mut count = 0;
+
+        for expected in 1..=2 {
+            wake();
+            wake();
+            assert_eq!(state.get(), FrameLoop::Scheduled);
+            event_loop.dispatch(Duration::ZERO, &mut count).unwrap();
+            assert_eq!(count, expected);
+            // Finishing the frame parks the loop again; a later click must wake it.
+            state.set(FrameLoop::Parked);
+        }
+    }
+
+    #[test]
+    fn wake_preserves_existing_frame_owners_and_defers_during_draw() {
+        let mut event_loop = EventLoop::<usize>::try_new().unwrap();
+        let (ping, source) = make_ping().unwrap();
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let state = Rc::new(Cell::new(FrameLoop::Unconfigured));
+        let wake = frame_waker(state.clone(), ping);
+        for owner in [
+            FrameLoop::Unconfigured,
+            FrameLoop::AwaitingCallback,
+            FrameLoop::Scheduled,
+            FrameLoop::RetryScheduled,
+            FrameLoop::PresentationFailed,
+            FrameLoop::RescheduleRequested,
+        ] {
+            state.set(owner);
+            wake();
+            assert_eq!(state.get(), owner);
+        }
+        state.set(FrameLoop::Ticking);
+        wake();
+        assert_eq!(state.get(), FrameLoop::RescheduleRequested);
+        let mut count = 0;
+        event_loop.dispatch(Duration::ZERO, &mut count).unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
 pub enum ImeInput {
     InsertText(String),
     SetMarkedText(String),
@@ -1080,18 +1158,7 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn schedule_frame(&self) {
-        match self.frame_loop.get() {
-            FrameLoop::Parked => {
-                self.frame_loop.set(FrameLoop::Scheduled);
-                self.frame_ping.ping();
-            }
-            FrameLoop::Ticking => {
-                self.frame_loop.set(FrameLoop::RescheduleRequested);
-            }
-            // A wake is already armed: a ping or retry timer is in flight, or a
-            // presented buffer guarantees a compositor frame callback.
-            _ => {}
-        }
+        schedule_frame(&self.frame_loop, &self.frame_ping);
     }
 
     fn request_redraw(&self) {
@@ -2031,6 +2098,13 @@ impl PlatformWindow for WaylandWindow {
 
     fn is_fullscreen(&self) -> bool {
         self.borrow().fullscreen
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        Some(frame_waker(
+            self.0.frame_loop.clone(),
+            self.0.frame_ping.clone(),
+        ))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
