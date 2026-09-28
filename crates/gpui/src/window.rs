@@ -6323,8 +6323,19 @@ impl Window {
     }
 
     /// Focus the current window and bring it to the foreground at the platform level.
-    pub fn activate_window(&self) {
-        self.platform_window.activate();
+    pub fn activate(&self) {
+        self.platform_window.activate(None);
+    }
+
+    /// Request focus using a token supplied by the desktop shell, such as a
+    /// Wayland tray host. Show the window before calling this method.
+    ///
+    /// Returns whether the platform submitted the request. The compositor may
+    /// still deny focus. Returns false for empty tokens or unsupported platforms;
+    /// callers can then fall back to [`Self::activate`]. Tokens must not
+    /// be reused for subsequent activations.
+    pub fn activate_with_token(&self, token: &str) -> bool {
+        !token.is_empty() && self.platform_window.activate(Some(token))
     }
 
     /// Requests that the operating system draw attention to this window.
@@ -6339,7 +6350,7 @@ impl Window {
 
     /// Show or hide the current window at the platform level.
     ///
-    /// Call [`Window::activate_window`] separately when the window should also receive focus.
+    /// Call [`Window::activate`] separately when the window should also receive focus.
     /// The window manager may still focus a window when it is shown.
     pub fn set_visible(&self, visible: bool) {
         self.platform_window.set_visible(visible);
@@ -8476,9 +8487,7 @@ mod tests {
             }
         });
 
-        window
-            .update(cx, |_, window, _| window.activate_window())
-            .unwrap();
+        window.update(cx, |_, window, _| window.activate()).unwrap();
         cx.executor().run_until_parked();
 
         window

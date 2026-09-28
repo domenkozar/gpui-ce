@@ -653,7 +653,7 @@ impl SystemWindowTabController {
         let next_index = (current_index + 1) % tabs.len();
 
         let _ = &tabs[next_index].handle.update(cx, |_, window, _| {
-            window.activate_window();
+            window.activate();
         });
     }
 
@@ -672,7 +672,7 @@ impl SystemWindowTabController {
         };
 
         let _ = &tabs[previous_index].handle.update(cx, |_, window, _| {
-            window.activate_window();
+            window.activate();
         });
     }
 }
