@@ -273,6 +273,13 @@ impl Application {
     where
         F: 'static + FnOnce(&mut App),
     {
+        #[cfg(all(
+            feature = "hot-patching",
+            debug_assertions,
+            not(target_family = "wasm")
+        ))]
+        dioxus_devtools::connect_subsecond();
+
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {

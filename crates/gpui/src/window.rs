@@ -1616,16 +1616,61 @@ impl Window {
                 .detach();
         }
 
+        #[cfg(all(
+            feature = "hot-patching",
+            debug_assertions,
+            not(target_family = "wasm")
+        ))]
+        let (hot_patch_sender, hot_patch_receiver) = async_channel::bounded(1);
+
         platform_window.on_close(Box::new({
             let window_id = handle.window_id();
             let mut cx = cx.to_async();
+            #[cfg(all(
+                feature = "hot-patching",
+                debug_assertions,
+                not(target_family = "wasm")
+            ))]
+            let hot_patch_sender = hot_patch_sender.clone();
             move || {
+                #[cfg(all(
+                    feature = "hot-patching",
+                    debug_assertions,
+                    not(target_family = "wasm")
+                ))]
+                hot_patch_sender.close();
                 let _ = handle.update(&mut cx, |_, window, _| window.remove_window());
                 let _ = cx.update(|cx| {
                     SystemWindowTabController::remove_tab(cx, window_id);
                 });
             }
         }));
+        #[cfg(all(
+            feature = "hot-patching",
+            debug_assertions,
+            not(target_family = "wasm")
+        ))]
+        {
+            // The patch callback runs off the UI thread. Forward it to the
+            // foreground executor so refresh can wake demand-driven platforms.
+            subsecond::register_handler(Arc::new(move || {
+                let _ = hot_patch_sender.try_send(());
+            }));
+            let mut cx = cx.to_async();
+            let foreground_executor = cx.foreground_executor().clone();
+            foreground_executor
+                .spawn(async move {
+                    while hot_patch_receiver.recv().await.is_ok() {
+                        if handle
+                            .update(&mut cx, |_, window, _| window.refresh())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+        }
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
